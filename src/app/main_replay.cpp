@@ -85,26 +85,30 @@ int main(int argc, char** argv) {
     uint64_t msgs_processed = 0;
     uint64_t last_seq = 0;
 
-    auto process_parsed = [&](ParsedMsg& parsed, uint64_t t1) {
+    auto process_itch = [&](ItchParseResult result, ItchParsedMsg& msg, uint64_t t1) {
         std::optional<BboUpdate> bbo_update;
 
-        if (auto* add = std::get_if<ParsedAdd>(&parsed)) {
-            last_seq = add->msg.seq_no;
-            bbo_update = book.add_order(add->msg.order_id, add->msg.price_ticks,
-                                        add->msg.qty, add->msg.side);
-        } else if (auto* mod = std::get_if<ParsedModify>(&parsed)) {
-            last_seq = mod->msg.seq_no;
-            bbo_update = book.modify_order(mod->msg.order_id,
-                                           mod->msg.new_price_ticks, mod->msg.new_qty);
-        } else if (auto* cancel = std::get_if<ParsedCancel>(&parsed)) {
-            last_seq = cancel->msg.seq_no;
-            bbo_update = book.cancel_order(cancel->msg.order_id);
-        } else if (auto* trade = std::get_if<ParsedTrade>(&parsed)) {
-            last_seq = trade->msg.seq_no;
-            bbo_update = book.apply_trade(trade->msg.order_id, trade->msg.qty);
-        } else if (auto* clr = std::get_if<ParsedClear>(&parsed)) {
-            last_seq = clr->msg.seq_no;
-            book.clear();
+        switch (result) {
+        case ItchParseResult::Add:
+            last_seq = msg.add.seq_no;
+            bbo_update = book.add_order(msg.add.order_id, msg.add.price_ticks,
+                                        msg.add.qty, msg.add.side);
+            break;
+        case ItchParseResult::Modify:
+            last_seq = msg.modify.seq_no;
+            bbo_update = book.modify_order(msg.modify.order_id,
+                                           msg.modify.new_price_ticks, msg.modify.new_qty);
+            break;
+        case ItchParseResult::Cancel:
+            last_seq = msg.cancel.seq_no;
+            bbo_update = book.cancel_order(msg.cancel.order_id);
+            break;
+        case ItchParseResult::Trade:
+            last_seq = msg.trade.seq_no;
+            bbo_update = book.apply_trade(msg.trade.order_id, msg.trade.qty);
+            break;
+        default:
+            break;
         }
 
         uint64_t t2 = rdtsc();
@@ -160,12 +164,13 @@ int main(int argc, char** argv) {
             msgs_processed++;
 
             uint64_t t0 = rdtsc();
-            auto parsed = itch_parser.parse(raw->msg_type, raw->data, raw->length);
+            ItchParsedMsg imsg;
+            auto result = itch_parser.parse(raw->msg_type, raw->data, raw->length, imsg);
             uint64_t t1 = rdtsc();
             lat.record(LatencyTracker::MdIngress, t0, t1);
 
-            if (!parsed) continue;
-            process_parsed(*parsed, t1);
+            if (result == ItchParseResult::Skipped) continue;
+            process_itch(result, imsg, t1);
         }
 
         auto t_end = rdtsc();
@@ -207,7 +212,67 @@ int main(int argc, char** argv) {
             lat.record(LatencyTracker::MdIngress, t0, t1);
 
             if (std::get_if<ParseError>(&parsed)) continue;
-            process_parsed(parsed, t1);
+
+            std::optional<BboUpdate> bbo_update;
+
+            if (auto* add = std::get_if<ParsedAdd>(&parsed)) {
+                last_seq = add->msg.seq_no;
+                bbo_update = book.add_order(add->msg.order_id, add->msg.price_ticks,
+                                            add->msg.qty, add->msg.side);
+            } else if (auto* mod = std::get_if<ParsedModify>(&parsed)) {
+                last_seq = mod->msg.seq_no;
+                bbo_update = book.modify_order(mod->msg.order_id,
+                                               mod->msg.new_price_ticks, mod->msg.new_qty);
+            } else if (auto* cancel = std::get_if<ParsedCancel>(&parsed)) {
+                last_seq = cancel->msg.seq_no;
+                bbo_update = book.cancel_order(cancel->msg.order_id);
+            } else if (auto* trade = std::get_if<ParsedTrade>(&parsed)) {
+                last_seq = trade->msg.seq_no;
+                bbo_update = book.apply_trade(trade->msg.order_id, trade->msg.qty);
+            } else if (auto* clr = std::get_if<ParsedClear>(&parsed)) {
+                last_seq = clr->msg.seq_no;
+                book.clear();
+            }
+
+            uint64_t t2 = rdtsc();
+            lat.record(LatencyTracker::BookUpdate, t1, t2);
+
+            if (!bbo_update) continue;
+
+            bbo_update->ts_local = t2;
+
+            auto intents = strategy.on_bbo(*bbo_update);
+            uint64_t t3 = rdtsc();
+            lat.record(LatencyTracker::Strategy, t2, t3);
+
+            for (auto& intent : intents) {
+                uint32_t ref_price = static_cast<uint32_t>(book.midprice());
+                auto snap = portfolio.snapshot(ref_price);
+
+                auto rr = risk.validate(intent, snap, ref_price);
+                uint64_t t4 = rdtsc();
+                lat.record(LatencyTracker::Risk, t3, t4);
+
+                if (rr != RiskResult::Accept) continue;
+
+                auto fills = gateway.submit_intent(intent);
+                uint64_t t5 = rdtsc();
+                lat.record(LatencyTracker::Gateway, t4, t5);
+
+                for (auto& fill : fills) {
+                    portfolio.apply_fill(fill.side, fill.fill_qty, fill.fill_price);
+                    strategy.on_fill(fill.side, fill.fill_qty);
+                    fill_log.push_back({last_seq, fill.side, fill.fill_qty, fill.fill_price});
+
+                    if (verbose) {
+                        printf("FILL seq=%" PRIu64 " %s qty=%u px=%u pos=%d cash=%" PRId64 "\n",
+                               last_seq,
+                               fill.side == Side::Bid ? "BUY " : "SELL",
+                               fill.fill_qty, fill.fill_price,
+                               portfolio.position(), portfolio.cash());
+                    }
+                }
+            }
         }
 
         auto t_end = rdtsc();

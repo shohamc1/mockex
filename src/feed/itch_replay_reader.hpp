@@ -5,7 +5,6 @@
 #include <cstdlib>
 #include <optional>
 #include <string>
-#include <vector>
 
 struct ItchRawMsg {
     char msg_type;
@@ -24,7 +23,7 @@ public:
     uint64_t msg_count() const { return msg_count_; }
 
 private:
-    std::vector<uint8_t> buf_;
+    const uint8_t* data_ = nullptr;
     size_t pos_ = 0;
     size_t size_ = 0;
     uint64_t msg_count_ = 0;

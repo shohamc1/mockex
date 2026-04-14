@@ -1,7 +1,8 @@
 #include "feed/itch_parser.hpp"
 
 ItchParser::ItchParser(size_t order_capacity, uint16_t filter_locate)
-    : orders_(order_capacity), filter_locate_(filter_locate) {}
+    : orders_(order_capacity), filter_locate_(filter_locate),
+      filtering_(filter_locate != 0) {}
 
 uint16_t ItchParser::read_be16(const uint8_t* p) {
     return (static_cast<uint16_t>(p[0]) << 8) | p[1];
@@ -29,17 +30,16 @@ int32_t ItchParser::read_be32_signed(const uint8_t* p) {
 }
 
 bool ItchParser::check_locate(const uint8_t* data, uint16_t len) const {
-    if (filter_locate_ == 0) return true;
+    if (!filtering_) return true;
     if (len < 3) return false;
     uint16_t loc = read_be16(data + 1);
     return loc == filter_locate_ || loc == 0;
 }
 
-std::optional<ParsedMsg> ItchParser::parse(char msg_type, const uint8_t* data, uint16_t len) {
+ItchParseResult ItchParser::parse(char msg_type, const uint8_t* data, uint16_t len, ItchParsedMsg& out) {
     switch (msg_type) {
     case 'A': {
-        if (len < 36) { stats_.skipped++; return std::nullopt; }
-        if (!check_locate(data, len)) { stats_.skipped++; return std::nullopt; }
+        if (len < 36 || !check_locate(data, len)) { stats_.skipped++; return ItchParseResult::Skipped; }
 
         uint64_t ts = read_ts6(data + 5);
         uint64_t order_id = read_be64(data + 11);
@@ -48,25 +48,23 @@ std::optional<ParsedMsg> ItchParser::parse(char msg_type, const uint8_t* data, u
         int32_t price_raw = read_be32_signed(data + 32);
         uint32_t price_ticks = static_cast<uint32_t>(price_raw / 100);
 
-        if (qty == 0 || price_ticks == 0) { stats_.skipped++; return std::nullopt; }
+        if (qty == 0 || price_ticks == 0) { stats_.skipped++; return ItchParseResult::Skipped; }
 
         orders_.insert(order_id, {price_ticks, qty, side});
         seq_no_++;
 
-        AddOrderMsg msg;
-        msg.seq_no = seq_no_;
-        msg.ts_exchange = ts;
-        msg.order_id = order_id;
-        msg.instrument_id = 0;
-        msg.price_ticks = price_ticks;
-        msg.qty = qty;
-        msg.side = side;
+        out.add.seq_no = seq_no_;
+        out.add.ts_exchange = ts;
+        out.add.order_id = order_id;
+        out.add.instrument_id = 0;
+        out.add.price_ticks = price_ticks;
+        out.add.qty = qty;
+        out.add.side = side;
         stats_.adds++;
-        return ParsedAdd{msg};
+        return ItchParseResult::Add;
     }
     case 'F': {
-        if (len < 40) { stats_.skipped++; return std::nullopt; }
-        if (!check_locate(data, len)) { stats_.skipped++; return std::nullopt; }
+        if (len < 40 || !check_locate(data, len)) { stats_.skipped++; return ItchParseResult::Skipped; }
 
         uint64_t ts = read_ts6(data + 5);
         uint64_t order_id = read_be64(data + 11);
@@ -75,32 +73,30 @@ std::optional<ParsedMsg> ItchParser::parse(char msg_type, const uint8_t* data, u
         int32_t price_raw = read_be32_signed(data + 32);
         uint32_t price_ticks = static_cast<uint32_t>(price_raw / 100);
 
-        if (qty == 0 || price_ticks == 0) { stats_.skipped++; return std::nullopt; }
+        if (qty == 0 || price_ticks == 0) { stats_.skipped++; return ItchParseResult::Skipped; }
 
         orders_.insert(order_id, {price_ticks, qty, side});
         seq_no_++;
 
-        AddOrderMsg msg;
-        msg.seq_no = seq_no_;
-        msg.ts_exchange = ts;
-        msg.order_id = order_id;
-        msg.instrument_id = 0;
-        msg.price_ticks = price_ticks;
-        msg.qty = qty;
-        msg.side = side;
+        out.add.seq_no = seq_no_;
+        out.add.ts_exchange = ts;
+        out.add.order_id = order_id;
+        out.add.instrument_id = 0;
+        out.add.price_ticks = price_ticks;
+        out.add.qty = qty;
+        out.add.side = side;
         stats_.adds++;
-        return ParsedAdd{msg};
+        return ItchParseResult::Add;
     }
     case 'E': {
-        if (len < 31) { stats_.skipped++; return std::nullopt; }
-        if (!check_locate(data, len)) { stats_.skipped++; return std::nullopt; }
+        if (len < 31 || !check_locate(data, len)) { stats_.skipped++; return ItchParseResult::Skipped; }
 
         uint64_t ts = read_ts6(data + 5);
         uint64_t order_id = read_be64(data + 11);
         uint32_t exec_qty = read_be32(data + 19);
 
         auto* state = orders_.find(order_id);
-        if (!state) { stats_.lookup_misses++; stats_.skipped++; return std::nullopt; }
+        if (!state) { stats_.lookup_misses++; stats_.skipped++; return ItchParseResult::Skipped; }
 
         uint32_t px = state->price_ticks;
         Side side = state->side;
@@ -114,20 +110,18 @@ std::optional<ParsedMsg> ItchParser::parse(char msg_type, const uint8_t* data, u
             state->qty = remaining - exec_qty;
         }
 
-        TradeMsg msg;
-        msg.seq_no = seq_no_;
-        msg.ts_exchange = ts;
-        msg.order_id = order_id;
-        msg.instrument_id = 0;
-        msg.price_ticks = px;
-        msg.qty = exec_qty;
-        msg.side = side;
+        out.trade.seq_no = seq_no_;
+        out.trade.ts_exchange = ts;
+        out.trade.order_id = order_id;
+        out.trade.instrument_id = 0;
+        out.trade.price_ticks = px;
+        out.trade.qty = exec_qty;
+        out.trade.side = side;
         stats_.trades++;
-        return ParsedTrade{msg};
+        return ItchParseResult::Trade;
     }
     case 'C': {
-        if (len < 36) { stats_.skipped++; return std::nullopt; }
-        if (!check_locate(data, len)) { stats_.skipped++; return std::nullopt; }
+        if (len < 36 || !check_locate(data, len)) { stats_.skipped++; return ItchParseResult::Skipped; }
 
         uint64_t ts = read_ts6(data + 5);
         uint64_t order_id = read_be64(data + 11);
@@ -151,27 +145,25 @@ std::optional<ParsedMsg> ItchParser::parse(char msg_type, const uint8_t* data, u
 
         seq_no_++;
 
-        TradeMsg msg;
-        msg.seq_no = seq_no_;
-        msg.ts_exchange = ts;
-        msg.order_id = order_id;
-        msg.instrument_id = 0;
-        msg.price_ticks = price_ticks;
-        msg.qty = exec_qty;
-        msg.side = side;
+        out.trade.seq_no = seq_no_;
+        out.trade.ts_exchange = ts;
+        out.trade.order_id = order_id;
+        out.trade.instrument_id = 0;
+        out.trade.price_ticks = price_ticks;
+        out.trade.qty = exec_qty;
+        out.trade.side = side;
         stats_.trades++;
-        return ParsedTrade{msg};
+        return ItchParseResult::Trade;
     }
     case 'X': {
-        if (len < 24) { stats_.skipped++; return std::nullopt; }
-        if (!check_locate(data, len)) { stats_.skipped++; return std::nullopt; }
+        if (len < 24 || !check_locate(data, len)) { stats_.skipped++; return ItchParseResult::Skipped; }
 
         uint64_t ts = read_ts6(data + 5);
         uint64_t order_id = read_be64(data + 11);
         uint32_t cancel_qty = read_be32(data + 19);
 
         auto* state = orders_.find(order_id);
-        if (!state) { stats_.lookup_misses++; stats_.skipped++; return std::nullopt; }
+        if (!state) { stats_.lookup_misses++; stats_.skipped++; return ItchParseResult::Skipped; }
 
         uint32_t remaining = state->qty;
 
@@ -183,42 +175,38 @@ std::optional<ParsedMsg> ItchParser::parse(char msg_type, const uint8_t* data, u
             state->qty = remaining - cancel_qty;
         }
 
-        CancelOrderMsg msg;
-        msg.seq_no = seq_no_;
-        msg.ts_exchange = ts;
-        msg.order_id = order_id;
-        msg.instrument_id = 0;
-        msg.canceled_qty = cancel_qty;
+        out.cancel.seq_no = seq_no_;
+        out.cancel.ts_exchange = ts;
+        out.cancel.order_id = order_id;
+        out.cancel.instrument_id = 0;
+        out.cancel.canceled_qty = cancel_qty;
         stats_.cancels++;
-        return ParsedCancel{msg};
+        return ItchParseResult::Cancel;
     }
     case 'D': {
-        if (len < 19) { stats_.skipped++; return std::nullopt; }
-        if (!check_locate(data, len)) { stats_.skipped++; return std::nullopt; }
+        if (len < 19 || !check_locate(data, len)) { stats_.skipped++; return ItchParseResult::Skipped; }
 
         uint64_t ts = read_ts6(data + 5);
         uint64_t order_id = read_be64(data + 11);
 
         auto* state = orders_.find(order_id);
-        if (!state) { stats_.lookup_misses++; stats_.skipped++; return std::nullopt; }
+        if (!state) { stats_.lookup_misses++; stats_.skipped++; return ItchParseResult::Skipped; }
 
         uint32_t remaining = state->qty;
 
         seq_no_++;
         orders_.erase(order_id);
 
-        CancelOrderMsg msg;
-        msg.seq_no = seq_no_;
-        msg.ts_exchange = ts;
-        msg.order_id = order_id;
-        msg.instrument_id = 0;
-        msg.canceled_qty = remaining;
+        out.cancel.seq_no = seq_no_;
+        out.cancel.ts_exchange = ts;
+        out.cancel.order_id = order_id;
+        out.cancel.instrument_id = 0;
+        out.cancel.canceled_qty = remaining;
         stats_.cancels++;
-        return ParsedCancel{msg};
+        return ItchParseResult::Cancel;
     }
     case 'U': {
-        if (len < 35) { stats_.skipped++; return std::nullopt; }
-        if (!check_locate(data, len)) { stats_.skipped++; return std::nullopt; }
+        if (len < 35 || !check_locate(data, len)) { stats_.skipped++; return ItchParseResult::Skipped; }
 
         uint64_t ts = read_ts6(data + 5);
         uint64_t orig_order_id = read_be64(data + 11);
@@ -228,7 +216,7 @@ std::optional<ParsedMsg> ItchParser::parse(char msg_type, const uint8_t* data, u
         uint32_t new_price = static_cast<uint32_t>(new_price_raw / 100);
 
         auto* state = orders_.find(orig_order_id);
-        if (!state) { stats_.lookup_misses++; stats_.skipped++; return std::nullopt; }
+        if (!state) { stats_.lookup_misses++; stats_.skipped++; return ItchParseResult::Skipped; }
 
         Side side = state->side;
         orders_.erase(orig_order_id);
@@ -236,19 +224,17 @@ std::optional<ParsedMsg> ItchParser::parse(char msg_type, const uint8_t* data, u
 
         seq_no_++;
 
-        ModifyOrderMsg msg;
-        msg.seq_no = seq_no_;
-        msg.ts_exchange = ts;
-        msg.order_id = orig_order_id;
-        msg.instrument_id = 0;
-        msg.new_price_ticks = new_price;
-        msg.new_qty = new_qty;
+        out.modify.seq_no = seq_no_;
+        out.modify.ts_exchange = ts;
+        out.modify.order_id = orig_order_id;
+        out.modify.instrument_id = 0;
+        out.modify.new_price_ticks = new_price;
+        out.modify.new_qty = new_qty;
         stats_.modifies++;
-        return ParsedModify{msg};
+        return ItchParseResult::Modify;
     }
     case 'P': {
-        if (len < 44) { stats_.skipped++; return std::nullopt; }
-        if (!check_locate(data, len)) { stats_.skipped++; return std::nullopt; }
+        if (len < 44 || !check_locate(data, len)) { stats_.skipped++; return ItchParseResult::Skipped; }
 
         uint64_t ts = read_ts6(data + 5);
         uint64_t order_id = read_be64(data + 11);
@@ -257,23 +243,22 @@ std::optional<ParsedMsg> ItchParser::parse(char msg_type, const uint8_t* data, u
         int32_t price_raw = read_be32_signed(data + 32);
         uint32_t price_ticks = static_cast<uint32_t>(price_raw / 100);
 
-        if (qty == 0 || price_ticks == 0) { stats_.skipped++; return std::nullopt; }
+        if (qty == 0 || price_ticks == 0) { stats_.skipped++; return ItchParseResult::Skipped; }
 
         seq_no_++;
 
-        TradeMsg msg;
-        msg.seq_no = seq_no_;
-        msg.ts_exchange = ts;
-        msg.order_id = order_id;
-        msg.instrument_id = 0;
-        msg.price_ticks = price_ticks;
-        msg.qty = qty;
-        msg.side = side;
+        out.trade.seq_no = seq_no_;
+        out.trade.ts_exchange = ts;
+        out.trade.order_id = order_id;
+        out.trade.instrument_id = 0;
+        out.trade.price_ticks = price_ticks;
+        out.trade.qty = qty;
+        out.trade.side = side;
         stats_.trades++;
-        return ParsedTrade{msg};
+        return ItchParseResult::Trade;
     }
     default:
         stats_.skipped++;
-        return std::nullopt;
+        return ItchParseResult::Skipped;
     }
 }

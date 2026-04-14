@@ -108,22 +108,30 @@ int main(int argc, char** argv) {
             while (auto raw = reader.next()) {
                 msgs++;
                 uint64_t t0 = rdtsc();
-                auto parsed = itch_parser.parse(raw->msg_type, raw->data, raw->length);
+                ItchParsedMsg imsg;
+                auto result = itch_parser.parse(raw->msg_type, raw->data, raw->length, imsg);
                 uint64_t t1 = rdtsc();
                 lat.record(LatencyTracker::MdIngress, t0, t1);
-                if (!parsed) continue;
+                if (result == ItchParseResult::Skipped) continue;
 
                 std::optional<BboUpdate> bbo_update;
-                if (auto* add = std::get_if<ParsedAdd>(&*parsed)) {
-                    bbo_update = book.add_order(add->msg.order_id, add->msg.price_ticks,
-                                                add->msg.qty, add->msg.side);
-                } else if (auto* mod = std::get_if<ParsedModify>(&*parsed)) {
-                    bbo_update = book.modify_order(mod->msg.order_id,
-                                                   mod->msg.new_price_ticks, mod->msg.new_qty);
-                } else if (auto* cancel = std::get_if<ParsedCancel>(&*parsed)) {
-                    bbo_update = book.cancel_order(cancel->msg.order_id);
-                } else if (auto* trade = std::get_if<ParsedTrade>(&*parsed)) {
-                    bbo_update = book.apply_trade(trade->msg.order_id, trade->msg.qty);
+                switch (result) {
+                case ItchParseResult::Add:
+                    bbo_update = book.add_order(imsg.add.order_id, imsg.add.price_ticks,
+                                                imsg.add.qty, imsg.add.side);
+                    break;
+                case ItchParseResult::Modify:
+                    bbo_update = book.modify_order(imsg.modify.order_id,
+                                                   imsg.modify.new_price_ticks, imsg.modify.new_qty);
+                    break;
+                case ItchParseResult::Cancel:
+                    bbo_update = book.cancel_order(imsg.cancel.order_id);
+                    break;
+                case ItchParseResult::Trade:
+                    bbo_update = book.apply_trade(imsg.trade.order_id, imsg.trade.qty);
+                    break;
+                default:
+                    break;
                 }
 
                 uint64_t t2 = rdtsc();

@@ -1,26 +1,38 @@
 #include "feed/replay_reader.hpp"
 #include <cstdio>
 #include <cstring>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 ReplayReader::~ReplayReader() { close(); }
 
 bool ReplayReader::open(const char* path) {
-    FILE* f = fopen(path, "rb");
-    if (!f) {
+    int fd = ::open(path, O_RDONLY);
+    if (fd < 0) {
         fprintf(stderr, "replay_reader: cannot open %s\n", path);
         return false;
     }
-    fseek(f, 0, SEEK_END);
-    size_ = static_cast<size_t>(ftell(f));
-    fseek(f, 0, SEEK_SET);
 
-    buf_.resize(size_);
-    if (fread(buf_.data(), 1, size_, f) != size_) {
-        fprintf(stderr, "replay_reader: read error\n");
-        fclose(f);
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        ::close(fd);
         return false;
     }
-    fclose(f);
+    size_ = static_cast<size_t>(st.st_size);
+
+    if (size_ > 0) {
+        data_ = static_cast<const uint8_t*>(mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0));
+        if (data_ == MAP_FAILED) {
+            fprintf(stderr, "replay_reader: mmap failed\n");
+            ::close(fd);
+            data_ = nullptr;
+            return false;
+        }
+    }
+    ::close(fd);
+
     pos_ = 0;
     msg_count_ = 0;
     last_seq_no_ = 0;
@@ -30,15 +42,17 @@ bool ReplayReader::open(const char* path) {
 }
 
 void ReplayReader::close() {
-    buf_.clear();
-    buf_.shrink_to_fit();
-    pos_ = 0;
+    if (data_ && size_ > 0) {
+        munmap(const_cast<uint8_t*>(data_), size_);
+    }
+    data_ = nullptr;
     size_ = 0;
+    pos_ = 0;
 }
 
 std::optional<RawMsg> ReplayReader::next() {
     while (pos_ + kWireHeaderSize <= size_) {
-        const uint8_t* hdr = buf_.data() + pos_;
+        const uint8_t* hdr = data_ + pos_;
         MsgType type = static_cast<MsgType>(hdr[0]);
         uint16_t payload_len;
         memcpy(&payload_len, hdr + 1, sizeof(payload_len));
@@ -49,7 +63,7 @@ std::optional<RawMsg> ReplayReader::next() {
             return std::nullopt;
         }
 
-        const uint8_t* payload = buf_.data() + pos_ + kWireHeaderSize;
+        const uint8_t* payload = data_ + pos_ + kWireHeaderSize;
         pos_ += total;
         msg_count_++;
 

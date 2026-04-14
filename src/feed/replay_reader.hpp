@@ -7,7 +7,6 @@
 #include <cstring>
 #include <optional>
 #include <string>
-#include <vector>
 
 struct RawMsg {
     MsgType type;
@@ -28,7 +27,7 @@ public:
     uint64_t gap_count() const { return gap_count_; }
 
 private:
-    std::vector<uint8_t> buf_;
+    const uint8_t* data_ = nullptr;
     size_t pos_ = 0;
     size_t size_ = 0;
     uint64_t last_seq_no_ = 0;
