@@ -1,0 +1,14 @@
+build/
+.cache/
+.ruff_cache/
+bench/
+*.o
+*.a
+*.dylib
+*.dSYM
+.DS_Store
+
+data/profile_feed.bin
+data/profile_sample*.txt
+data/profile.json
+data/*.gz
