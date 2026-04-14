@@ -1,10 +1,9 @@
 #pragma once
 
 #include "common/types.hpp"
+#include "common/flat_hash_map.hpp"
 #include "exchange/exchange_sim.hpp"
 #include <cstdint>
-#include <unordered_map>
-#include <vector>
 
 struct GatewayStats {
     uint64_t orders_sent = 0;
@@ -13,19 +12,39 @@ struct GatewayStats {
     uint64_t rejects_received = 0;
 };
 
+struct FillInfo {
+    uint32_t instrument_id;
+    Side side;
+    uint32_t fill_qty;
+    uint32_t fill_price;
+};
+
+struct FillResults {
+    static constexpr size_t kMaxFills = 4;
+    FillInfo fills[kMaxFills];
+    size_t count = 0;
+
+    void push_back(const FillInfo& f) {
+        if (count < kMaxFills) {
+            fills[count++] = f;
+        }
+    }
+
+    FillInfo* begin() { return fills; }
+    FillInfo* end() { return fills + count; }
+    const FillInfo* begin() const { return fills; }
+    const FillInfo* end() const { return fills + count; }
+    size_t size() const { return count; }
+    bool empty() const { return count == 0; }
+};
+
 class OrderGateway {
 public:
-    explicit OrderGateway(ExchangeSim& sim) : sim_(sim) {}
+    explicit OrderGateway(ExchangeSim& sim, size_t expected_orders = 65536)
+        : sim_(sim), active_orders_(expected_orders * 10 / 7) {}
 
-    struct FillInfo {
-        uint32_t instrument_id;
-        Side side;
-        uint32_t fill_qty;
-        uint32_t fill_price;
-    };
-
-    std::vector<FillInfo> submit_intent(const OrderIntent& intent) {
-        std::vector<FillInfo> fills;
+    FillResults submit_intent(const OrderIntent& intent) {
+        FillResults fills;
 
         if (intent.action == OrderAction::New) {
             OutboundOrder out;
@@ -36,17 +55,17 @@ public:
             out.qty = intent.qty;
             out.action = OrderAction::New;
 
-            active_orders_[out.client_order_id] = {
+            active_orders_.insert(out.client_order_id, {
                 out.client_order_id,
                 out.instrument_id,
                 out.side,
                 out.price_ticks,
                 out.qty
-            };
+            });
 
             stats_.orders_sent++;
             auto reports = sim_.submit(out);
-            fills = process_reports(reports);
+            process_reports(reports, fills);
         } else if (intent.action == OrderAction::Cancel) {
             OutboundOrder out;
             out.client_order_id = intent.orig_client_order_id;
@@ -58,7 +77,7 @@ public:
 
             stats_.orders_cancelled++;
             auto reports = sim_.submit(out);
-            fills = process_reports(reports);
+            process_reports(reports, fills);
         }
 
         return fills;
@@ -68,23 +87,23 @@ public:
     uint64_t next_order_id() const { return next_order_id_; }
 
 private:
-    std::vector<FillInfo> process_reports(const std::vector<ExecutionReport>& reports) {
-        std::vector<FillInfo> fills;
-        for (auto& r : reports) {
+    void process_reports(const ExecutionReports& reports, FillResults& fills) {
+        for (size_t i = 0; i < reports.size(); ++i) {
+            const auto& r = reports[i];
             switch (r.type) {
             case ExecType::Fill:
             case ExecType::PartialFill: {
-                auto it = active_orders_.find(r.client_order_id);
-                if (it != active_orders_.end()) {
+                auto* order = active_orders_.find(r.client_order_id);
+                if (order) {
                     fills.push_back({
-                        it->second.instrument_id,
-                        it->second.side,
+                        order->instrument_id,
+                        order->side,
                         r.filled_qty,
                         r.fill_price_ticks
                     });
                     stats_.fills_received++;
                     if (r.remaining_qty == 0) {
-                        active_orders_.erase(it);
+                        active_orders_.erase(r.client_order_id);
                     }
                 }
                 break;
@@ -101,11 +120,10 @@ private:
                 break;
             }
         }
-        return fills;
     }
 
     ExchangeSim& sim_;
     uint64_t next_order_id_ = 1;
-    std::unordered_map<uint64_t, RestingOrder> active_orders_;
+    FlatHashMap<uint64_t, RestingOrder> active_orders_;
     GatewayStats stats_;
 };

@@ -69,8 +69,8 @@ int main(int argc, char** argv) {
     OrderBook book(0);
     MarketMaker strategy(strat_cfg);
     RiskEngine risk(risk_limits);
-    ExchangeSim exchange;
-    OrderGateway gateway(exchange);
+    ExchangeSim exchange(1 << 20);
+    OrderGateway gateway(exchange, 1 << 20);
     Portfolio portfolio(1);
 
     std::vector<FillLogEntry> fill_log;

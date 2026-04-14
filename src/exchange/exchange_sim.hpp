@@ -1,10 +1,9 @@
 #pragma once
 
 #include "common/types.hpp"
+#include "common/flat_hash_map.hpp"
 #include <cstdint>
 #include <map>
-#include <unordered_map>
-#include <vector>
 
 struct RestingOrder {
     uint64_t client_order_id;
@@ -16,9 +15,10 @@ struct RestingOrder {
 
 class ExchangeSim {
 public:
-    std::vector<ExecutionReport> submit(const OutboundOrder& ord) {
-        std::vector<ExecutionReport> reports;
-        reports.reserve(2);
+    explicit ExchangeSim(size_t expected_orders = 65536)
+        : by_id_(expected_orders * 10 / 7) {}
+    ExecutionReports submit(const OutboundOrder& ord) {
+        ExecutionReports reports;
 
         uint32_t remaining = ord.qty;
 
@@ -92,16 +92,15 @@ public:
                 } else {
                     asks_[ord.price_ticks] = ro;
                 }
-                by_id_[ord.client_order_id] = ro;
+                by_id_.insert(ord.client_order_id, ro);
             }
         } else if (ord.action == OrderAction::Cancel) {
-            auto id_it = by_id_.find(ord.client_order_id);
-            if (id_it != by_id_.end()) {
-                auto& resting = id_it->second;
-                if (resting.side == Side::Bid) {
-                    bids_.erase(resting.price_ticks);
+            auto* resting = by_id_.find(ord.client_order_id);
+            if (resting) {
+                if (resting->side == Side::Bid) {
+                    bids_.erase(resting->price_ticks);
                 } else {
-                    asks_.erase(resting.price_ticks);
+                    asks_.erase(resting->price_ticks);
                 }
                 reports.push_back({
                     ord.client_order_id,
@@ -111,7 +110,7 @@ public:
                     0,
                     0
                 });
-                by_id_.erase(id_it);
+                by_id_.erase(ord.client_order_id);
             }
         }
 
@@ -129,5 +128,5 @@ public:
 private:
     std::map<uint32_t, RestingOrder> bids_;
     std::map<uint32_t, RestingOrder> asks_;
-    std::unordered_map<uint64_t, RestingOrder> by_id_;
+    FlatHashMap<uint64_t, RestingOrder> by_id_;
 };

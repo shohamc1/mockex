@@ -166,3 +166,24 @@ struct StrategyOutput {
     size_t size() const { return count; }
     bool empty() const { return count == 0; }
 };
+
+struct ExecutionReports {
+    static constexpr size_t kMaxReports = 4;
+    ExecutionReport reports[kMaxReports];
+    size_t count = 0;
+
+    void push_back(const ExecutionReport& r) {
+        if (count < kMaxReports) {
+            reports[count++] = r;
+        }
+    }
+
+    ExecutionReport* begin() { return reports; }
+    ExecutionReport* end() { return reports + count; }
+    const ExecutionReport* begin() const { return reports; }
+    const ExecutionReport* end() const { return reports + count; }
+    size_t size() const { return count; }
+    bool empty() const { return count == 0; }
+    ExecutionReport& operator[](size_t i) { return reports[i]; }
+    const ExecutionReport& operator[](size_t i) const { return reports[i]; }
+};

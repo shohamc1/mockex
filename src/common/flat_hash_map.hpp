@@ -122,6 +122,14 @@ private:
         }
     }
 
+    // TODO: Investigate hash map growth strategies for low-latency trading systems.
+    //       Current grow() does malloc+free per call via std::vector resize.
+    //       Alternatives to research:
+    //         1. Arena/bump allocator — make growth a pointer bump, reclaim between sessions
+    //         2. mmap + mremap (Linux) — grow pages in-place, no copy
+    //         3. Two-buffer swap — pre-allocate current + next-size buffer, rehash into pre-existing larger buffer
+    //         4. Pre-size to worst case + assert on overflow — treat any allocation during trading as a bug
+    //         5. What do LSE Millenium, CME iLink, openHFT, Artio, etc. actually use?
     void grow() {
         capacity_ <<= 1;
         mask_ = capacity_ - 1;
