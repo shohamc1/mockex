@@ -3,30 +3,66 @@
 #include "common/latency_tracker.hpp"
 #include "feed/replay_reader.hpp"
 #include "feed/parser.hpp"
+#include "feed/itch_replay_reader.hpp"
+#include "feed/itch_parser.hpp"
 #include "book/order_book.hpp"
 #include "strategy/market_maker.hpp"
 #include "risk/risk_engine.hpp"
 #include "gateway/order_gateway.hpp"
 #include "exchange/exchange_sim.hpp"
 #include "portfolio/portfolio.hpp"
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
 
+struct IterResult {
+    uint64_t msgs;
+    double elapsed_ms;
+    double throughput;
+    int fills;
+};
+
+template<typename GetNext, typename RunPipeline>
+static std::pair<uint64_t, int> run_loop(GetNext get_next, RunPipeline run) {
+    uint64_t msgs = 0;
+    int fills = 0;
+    while (true) {
+        auto raw = get_next();
+        if (!raw) break;
+        msgs++;
+        fills += run(*raw);
+    }
+    return {msgs, fills};
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <feed.bin> [iterations]\n", argv[0]);
+        fprintf(stderr, "usage: %s <feed.bin> [iterations] [--format native|itch] [--locate N]\n", argv[0]);
         return 1;
     }
 
     const char* feed_path = argv[1];
     int iterations = 10;
-    if (argc >= 3) iterations = atoi(argv[2]);
+    bool use_itch = false;
+    uint16_t locate_filter = 0;
+
+    for (int i = 2; i < argc; ++i) {
+        if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+            ++i;
+            use_itch = (strcmp(argv[i], "itch") == 0);
+        } else if (strcmp(argv[i], "--locate") == 0 && i + 1 < argc) {
+            locate_filter = static_cast<uint16_t>(atoi(argv[++i]));
+        } else {
+            iterations = atoi(argv[i]);
+        }
+    }
     if (iterations < 1) iterations = 1;
 
-    printf("Benchmark: %d iterations over %s\n\n", iterations, feed_path);
+    printf("Benchmark: %d iterations over %s (format: %s)\n\n",
+           iterations, feed_path, use_itch ? "itch" : "native");
 
     StrategyConfig strat_cfg;
     strat_cfg.base_spread_ticks = 2;
@@ -43,13 +79,6 @@ int main(int argc, char** argv) {
     uint64_t freq = tsc_frequency();
     printf("TSC frequency: %" PRIu64 " Hz\n\n", freq);
 
-    struct IterResult {
-        uint64_t msgs;
-        double elapsed_ms;
-        double throughput;
-        int fills;
-    };
-
     std::vector<IterResult> results;
     results.reserve(iterations);
 
@@ -57,9 +86,6 @@ int main(int argc, char** argv) {
     best_lat.set_tsc_freq(freq);
 
     for (int iter = 0; iter < iterations; ++iter) {
-        ReplayReader reader;
-        if (!reader.open(feed_path)) return 1;
-
         LatencyTracker lat;
         lat.set_tsc_freq(freq);
 
@@ -74,57 +100,117 @@ int main(int argc, char** argv) {
         int fills = 0;
         auto t_start = rdtsc();
 
-        while (auto raw = reader.next()) {
-            msgs++;
-            uint64_t t0 = rdtsc();
-            auto parsed = Parser::parse(raw->type, raw->data, raw->length);
-            uint64_t t1 = rdtsc();
-            lat.record(LatencyTracker::MdIngress, t0, t1);
+        if (use_itch) {
+            ItchReplayReader reader;
+            reader.open(feed_path);
+            ItchParser itch_parser(1 << 20, locate_filter);
 
-            std::optional<BboUpdate> bbo_update;
+            while (auto raw = reader.next()) {
+                msgs++;
+                uint64_t t0 = rdtsc();
+                auto parsed = itch_parser.parse(raw->msg_type, raw->data, raw->length);
+                uint64_t t1 = rdtsc();
+                lat.record(LatencyTracker::MdIngress, t0, t1);
+                if (!parsed) continue;
 
-            if (auto* add = std::get_if<ParsedAdd>(&parsed)) {
-                bbo_update = book.add_order(add->msg.order_id, add->msg.price_ticks,
-                                            add->msg.qty, add->msg.side);
-            } else if (auto* mod = std::get_if<ParsedModify>(&parsed)) {
-                bbo_update = book.modify_order(mod->msg.order_id,
-                                               mod->msg.new_price_ticks, mod->msg.new_qty);
-            } else if (auto* cancel = std::get_if<ParsedCancel>(&parsed)) {
-                bbo_update = book.cancel_order(cancel->msg.order_id);
-            } else if (auto* trade = std::get_if<ParsedTrade>(&parsed)) {
-                bbo_update = book.apply_trade(trade->msg.order_id, trade->msg.qty);
-            } else if (auto* clr = std::get_if<ParsedClear>(&parsed)) {
-                book.clear();
-            } else {
-                continue;
+                std::optional<BboUpdate> bbo_update;
+                if (auto* add = std::get_if<ParsedAdd>(&*parsed)) {
+                    bbo_update = book.add_order(add->msg.order_id, add->msg.price_ticks,
+                                                add->msg.qty, add->msg.side);
+                } else if (auto* mod = std::get_if<ParsedModify>(&*parsed)) {
+                    bbo_update = book.modify_order(mod->msg.order_id,
+                                                   mod->msg.new_price_ticks, mod->msg.new_qty);
+                } else if (auto* cancel = std::get_if<ParsedCancel>(&*parsed)) {
+                    bbo_update = book.cancel_order(cancel->msg.order_id);
+                } else if (auto* trade = std::get_if<ParsedTrade>(&*parsed)) {
+                    bbo_update = book.apply_trade(trade->msg.order_id, trade->msg.qty);
+                }
+
+                uint64_t t2 = rdtsc();
+                lat.record(LatencyTracker::BookUpdate, t1, t2);
+
+                if (!bbo_update) continue;
+
+                auto intents = strategy.on_bbo(*bbo_update);
+                uint64_t t3 = rdtsc();
+                lat.record(LatencyTracker::Strategy, t2, t3);
+
+                for (auto& intent : intents) {
+                    uint32_t ref_price = static_cast<uint32_t>(book.midprice());
+                    auto snap = portfolio.snapshot(ref_price);
+                    auto rr = risk.validate(intent, snap, ref_price);
+                    uint64_t t4 = rdtsc();
+                    lat.record(LatencyTracker::Risk, t3, t4);
+
+                    if (rr != RiskResult::Accept) continue;
+
+                    auto fill_list = gateway.submit_intent(intent);
+                    uint64_t t5 = rdtsc();
+                    lat.record(LatencyTracker::Gateway, t4, t5);
+
+                    for (auto& fill : fill_list) {
+                        portfolio.apply_fill(fill.side, fill.fill_qty, fill.fill_price);
+                        strategy.on_fill(fill.side, fill.fill_qty);
+                        fills++;
+                    }
+                }
             }
+        } else {
+            ReplayReader reader;
+            reader.open(feed_path);
 
-            uint64_t t2 = rdtsc();
-            lat.record(LatencyTracker::BookUpdate, t1, t2);
+            while (auto raw = reader.next()) {
+                msgs++;
+                uint64_t t0 = rdtsc();
+                auto parsed = Parser::parse(raw->type, raw->data, raw->length);
+                uint64_t t1 = rdtsc();
+                lat.record(LatencyTracker::MdIngress, t0, t1);
 
-            if (!bbo_update) continue;
+                std::optional<BboUpdate> bbo_update;
 
-            auto intents = strategy.on_bbo(*bbo_update);
-            uint64_t t3 = rdtsc();
-            lat.record(LatencyTracker::Strategy, t2, t3);
+                if (auto* add = std::get_if<ParsedAdd>(&parsed)) {
+                    bbo_update = book.add_order(add->msg.order_id, add->msg.price_ticks,
+                                                add->msg.qty, add->msg.side);
+                } else if (auto* mod = std::get_if<ParsedModify>(&parsed)) {
+                    bbo_update = book.modify_order(mod->msg.order_id,
+                                                   mod->msg.new_price_ticks, mod->msg.new_qty);
+                } else if (auto* cancel = std::get_if<ParsedCancel>(&parsed)) {
+                    bbo_update = book.cancel_order(cancel->msg.order_id);
+                } else if (auto* trade = std::get_if<ParsedTrade>(&parsed)) {
+                    bbo_update = book.apply_trade(trade->msg.order_id, trade->msg.qty);
+                } else if (std::get_if<ParsedClear>(&parsed)) {
+                    book.clear();
+                } else {
+                    continue;
+                }
 
-            for (auto& intent : intents) {
-                uint32_t ref_price = static_cast<uint32_t>(book.midprice());
-                auto snap = portfolio.snapshot(ref_price);
-                auto rr = risk.validate(intent, snap, ref_price);
-                uint64_t t4 = rdtsc();
-                lat.record(LatencyTracker::Risk, t3, t4);
+                uint64_t t2 = rdtsc();
+                lat.record(LatencyTracker::BookUpdate, t1, t2);
 
-                if (rr != RiskResult::Accept) continue;
+                if (!bbo_update) continue;
 
-                auto fill_list = gateway.submit_intent(intent);
-                uint64_t t5 = rdtsc();
-                lat.record(LatencyTracker::Gateway, t4, t5);
+                auto intents = strategy.on_bbo(*bbo_update);
+                uint64_t t3 = rdtsc();
+                lat.record(LatencyTracker::Strategy, t2, t3);
 
-                for (auto& fill : fill_list) {
-                    portfolio.apply_fill(fill.side, fill.fill_qty, fill.fill_price);
-                    strategy.on_fill(fill.side, fill.fill_qty);
-                    fills++;
+                for (auto& intent : intents) {
+                    uint32_t ref_price = static_cast<uint32_t>(book.midprice());
+                    auto snap = portfolio.snapshot(ref_price);
+                    auto rr = risk.validate(intent, snap, ref_price);
+                    uint64_t t4 = rdtsc();
+                    lat.record(LatencyTracker::Risk, t3, t4);
+
+                    if (rr != RiskResult::Accept) continue;
+
+                    auto fill_list = gateway.submit_intent(intent);
+                    uint64_t t5 = rdtsc();
+                    lat.record(LatencyTracker::Gateway, t4, t5);
+
+                    for (auto& fill : fill_list) {
+                        portfolio.apply_fill(fill.side, fill.fill_qty, fill.fill_price);
+                        strategy.on_fill(fill.side, fill.fill_qty);
+                        fills++;
+                    }
                 }
             }
         }

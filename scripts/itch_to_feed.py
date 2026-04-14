@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Convert NASDAQ TotalView ITCH 5.0 binary file to internal feed format."""
+"""Convert NASDAQ TotalView ITCH 5.0 binary file to internal feed format.
+
+Field offsets per the official NASDAQ ITCH 5.0 specification.
+All ITCH fields are big-endian. Timestamps are 6 bytes (nanoseconds since midnight).
+Prices are int32 in 1/10000ths of a dollar (Price(4)).
+"""
 
 import struct
 import argparse
@@ -15,7 +20,6 @@ MSG_CLEAR = 4
 
 
 def read_msg(f):
-    """Read one ITCH message. Returns (msg_type_char, payload_bytes) or None."""
     length_data = f.read(2)
     if len(length_data) < 2:
         return None
@@ -27,24 +31,28 @@ def read_msg(f):
     return msg_type, payload
 
 
-def parse_str(data, offset, length):
-    return data[offset : offset + length].decode("ascii", errors="replace").strip()
+def parse_uint16(data, offset):
+    return struct.unpack(">H", data[offset : offset + 2])[0]
 
 
 def parse_uint32(data, offset):
     return struct.unpack(">I", data[offset : offset + 4])[0]
 
 
-def parse_uint64(data, offset):
-    return struct.unpack(">Q", data[offset : offset + 8])[0]
-
-
 def parse_int32(data, offset):
     return struct.unpack(">i", data[offset : offset + 4])[0]
 
 
-def parse_int64(data, offset):
-    return struct.unpack(">q", data[offset : offset + 8])[0]
+def parse_ts6(data, offset):
+    return struct.unpack(">Q", b"\x00\x00" + data[offset : offset + 6])[0]
+
+
+def parse_uint64(data, offset):
+    return struct.unpack(">Q", data[offset : offset + 8])[0]
+
+
+def parse_str(data, offset, length):
+    return data[offset : offset + length].decode("ascii", errors="replace").strip()
 
 
 def write_msg(out, msg_type, payload):
@@ -71,31 +79,6 @@ def make_modify(seq, ts, order_id, inst_id, new_price, new_qty):
 
 def make_clear(seq, ts, inst_id):
     return struct.pack("<QQI", seq, ts, inst_id)
-
-
-ITCH_MSG_SIZES = {
-    "S": 12,  # System Event
-    "R": 39,  # Stock Directory
-    "H": 25,  # Trading Action
-    "Y": 20,  # Reg SHO
-    "L": 26,  # Market Participant Position
-    "V": 35,  # MWCB Decline Level
-    "W": 12,  # MWCB Breach
-    "K": 28,  # IPO Quoting Period Update
-    "J": 35,  # LULD Auction Collar
-    "A": 36,  # Add Order (no MPID)
-    "F": 40,  # Add Order (with MPID)
-    "E": 31,  # Order Executed
-    "C": 36,  # Order Executed with Price
-    "X": 24,  # Order Cancel
-    "D": 19,  # Order Delete
-    "U": 35,  # Order Replace
-    "P": 44,  # Trade (non-cross)
-    "Q": 40,  # Cross Trade
-    "B": 19,  # Broken Trade
-    "I": 50,  # NOII
-    "N": 20,  # Retail Interest
-}
 
 
 def main():
@@ -166,8 +149,10 @@ def main():
                 pct_markers.discard(pct)
 
             if msg_type == "R":
+                if len(payload) < 39:
+                    continue
                 loc = parse_uint16(payload, 1)
-                ticker = parse_str(payload, 3, 8)
+                ticker = parse_str(payload, 11, 8)
                 if ticker not in stock_map:
                     stock_map[ticker] = next_inst_id
                     next_inst_id += 1
@@ -175,7 +160,7 @@ def main():
                     target_locate = loc
 
             elif msg_type == "S":
-                event = payload[1:2]
+                pass
 
             elif msg_type == "A":
                 if len(payload) < 36:
@@ -183,19 +168,16 @@ def main():
                 locate = parse_uint16(payload, 1)
                 if args.symbol and locate != target_locate:
                     continue
-                if not args.symbol and target_locate is None:
-                    if args.symbol is None:
-                        pass
 
-                ts = parse_uint64(payload, 6)
-                order_id = parse_uint64(payload, 14)
-                side_char = payload[22:23]
-                qty = parse_uint32(payload, 23)
-                price_raw = parse_int32(payload, 27)
+                ts = parse_ts6(payload, 5)
+                order_id = parse_uint64(payload, 11)
+                side_char = chr(payload[19])
+                qty = parse_uint32(payload, 20)
+                price_raw = parse_int32(payload, 32)
                 price_ticks = price_raw // 100
 
                 inst_id = 0
-                side = 0 if side_char == b"B" else 1
+                side = 0 if side_char == "B" else 1
 
                 if price_ticks == 0 or qty == 0:
                     continue
@@ -216,14 +198,14 @@ def main():
                 if args.symbol and locate != target_locate:
                     continue
 
-                ts = parse_uint64(payload, 6)
-                order_id = parse_uint64(payload, 14)
-                side_char = payload[22:23]
-                qty = parse_uint32(payload, 23)
-                price_raw = parse_int32(payload, 27)
+                ts = parse_ts6(payload, 5)
+                order_id = parse_uint64(payload, 11)
+                side_char = chr(payload[19])
+                qty = parse_uint32(payload, 20)
+                price_raw = parse_int32(payload, 32)
                 price_ticks = price_raw // 100
 
-                side = 0 if side_char == b"B" else 1
+                side = 0 if side_char == "B" else 1
                 if price_ticks == 0 or qty == 0:
                     continue
 
@@ -243,9 +225,9 @@ def main():
                 if args.symbol and locate != target_locate:
                     continue
 
-                ts = parse_uint64(payload, 6)
-                order_id = parse_uint64(payload, 14)
-                exec_qty = parse_uint32(payload, 22)
+                ts = parse_ts6(payload, 5)
+                order_id = parse_uint64(payload, 11)
+                exec_qty = parse_uint32(payload, 19)
 
                 if order_id in itched_orders:
                     px, remaining, side = itched_orders[order_id]
@@ -269,12 +251,11 @@ def main():
                 if args.symbol and locate != target_locate:
                     continue
 
-                ts = parse_uint64(payload, 6)
-                order_id = parse_uint64(payload, 14)
-                exec_qty = parse_uint32(payload, 22)
-                price_raw = parse_int32(payload, 27)
+                ts = parse_ts6(payload, 5)
+                order_id = parse_uint64(payload, 11)
+                exec_qty = parse_uint32(payload, 19)
+                price_raw = parse_int32(payload, 32)
                 price_ticks = price_raw // 100
-                side_byte = payload[31:32]
 
                 side = 0
                 if order_id in itched_orders:
@@ -302,9 +283,9 @@ def main():
                 if args.symbol and locate != target_locate:
                     continue
 
-                ts = parse_uint64(payload, 6)
-                order_id = parse_uint64(payload, 14)
-                cancel_qty = parse_uint32(payload, 22)
+                ts = parse_ts6(payload, 5)
+                order_id = parse_uint64(payload, 11)
+                cancel_qty = parse_uint32(payload, 19)
 
                 if order_id in itched_orders:
                     px, remaining, side = itched_orders[order_id]
@@ -326,8 +307,8 @@ def main():
                 if args.symbol and locate != target_locate:
                     continue
 
-                ts = parse_uint64(payload, 6)
-                order_id = parse_uint64(payload, 14)
+                ts = parse_ts6(payload, 5)
+                order_id = parse_uint64(payload, 11)
 
                 if order_id in itched_orders:
                     px, remaining, side = itched_orders[order_id]
@@ -345,10 +326,10 @@ def main():
                 if args.symbol and locate != target_locate:
                     continue
 
-                ts = parse_uint64(payload, 6)
-                orig_order_id = parse_uint64(payload, 14)
-                new_order_id = parse_uint64(payload, 22)
-                new_qty = parse_uint32(payload, 30)
+                ts = parse_ts6(payload, 5)
+                orig_order_id = parse_uint64(payload, 11)
+                new_order_id = parse_uint64(payload, 19)
+                new_qty = parse_uint32(payload, 27)
                 new_price_raw = parse_int32(payload, 31)
                 new_price = new_price_raw // 100
 
@@ -371,14 +352,14 @@ def main():
                 if args.symbol and locate != target_locate:
                     continue
 
-                ts = parse_uint64(payload, 6)
-                order_id = parse_uint64(payload, 14)
-                side_char = payload[22:23]
-                qty = parse_uint32(payload, 23)
-                price_raw = parse_int32(payload, 27)
+                ts = parse_ts6(payload, 5)
+                order_id = parse_uint64(payload, 11)
+                side_char = chr(payload[19])
+                qty = parse_uint32(payload, 20)
+                price_raw = parse_int32(payload, 32)
                 price_ticks = price_raw // 100
 
-                side = 0 if side_char == b"B" else 1
+                side = 0 if side_char == "B" else 1
                 if qty > 0 and price_ticks > 0:
                     seq += 1
                     write_msg(
@@ -405,10 +386,6 @@ def main():
         for k, v in sorted(counts.items()):
             if not k.startswith("out_"):
                 print(f"    '{k}': {v}")
-
-
-def parse_uint16(data, offset):
-    return struct.unpack(">H", data[offset : offset + 2])[0]
 
 
 if __name__ == "__main__":

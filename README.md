@@ -42,6 +42,8 @@ All latency is measured with `rdtsc` (x86) / `cntvct_el0` (ARM), reported as p50
 
 ## Performance
 
+> **Note:** ITCH-to-internal-format conversion is done offline by `scripts/itch_to_feed.py`. The C++ pipeline receives pre-parsed binary messages, so the measured path starts from the internal parser — not from raw ITCH wire bytes. In production, a real-time feed handler would sit upstream and parse ITCH multicast (big-endian byte swaps, locate-code lookups, order-state tracking for executions/cancels). That stage is excluded from the benchmarks below. To measure full wire-to-fill latency, a runtime ITCH parser would need to be added as a measured pipeline stage.
+
 Benchmarked on Apple Silicon (ARM64), 10M messages, ~100K active orders, Release build (`-O3 -march=native -flto`):
 
 ```
